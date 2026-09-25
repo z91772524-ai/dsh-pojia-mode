@@ -28,11 +28,18 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 base = fso.GetParentFolderName(WScript.ScriptFullName)
 ps1  = fso.BuildPath(base, "unlock-dsh.ps1")
 
-' ---- 取参数（默认 install） ----
+' ---- 取参数（默认 install），白名单校验 ----
+' action 会被直接拼进内层 PowerShell 命令行，所以必须限定在已知值内 ——
+' 否则带空格或分号的参数就等于任意命令注入。
 action = "install"
 If WScript.Arguments.Count > 0 Then
-  If Len(Trim(WScript.Arguments(0))) > 0 Then action = Trim(WScript.Arguments(0))
+  If Len(Trim(WScript.Arguments(0))) > 0 Then action = LCase(Trim(WScript.Arguments(0)))
 End If
+Select Case action
+  Case "install", "uninstall", "check", "dry-run", "list", "diagnose"
+  Case Else
+    action = "install"
+End Select
 
 ' ---- 日志 ----
 logDir  = sh.ExpandEnvironmentStrings("%USERPROFILE%") & "\.dsh\logs"
@@ -72,7 +79,7 @@ End If
 ' 刻意不加 -WindowStyle Hidden（见教训 1）。
 inner = _
   "$ErrorActionPreference='Continue'; " & _
-  "$out = & '" & ps1 & "' " & action & " *>&1 | Out-String; " & _
+  "$out = & '" & ps1 & "' " & action & " -Yes *>&1 | Out-String; " & _
   "$code = $LASTEXITCODE; if ($null -eq $code) { $code = 0 }; " & _
   "[System.IO.File]::WriteAllText('" & resultFile & "', $out); " & _
   "Add-Type -AssemblyName System.Windows.Forms; " & _

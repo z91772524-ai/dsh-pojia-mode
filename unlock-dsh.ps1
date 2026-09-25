@@ -11,11 +11,12 @@
     DSH 自带插件包，因此不需要定位或修改部署自带的 preset。
 
 .PARAMETER Action
-     install    安装 / 覆盖安装（默认）
-     uninstall  卸载，删除 preset 目录
-     check      自检：核对文件是否就位、composition 是否完整
-     dry-run    只打印将要写入的内容与目标路径，不落盘
-     list       列出当前所有已安装 preset
+    install    安装 / 覆盖安装（默认）
+    uninstall  卸载，把 preset 目录移到 _uninstalled-* 备份目录
+    check      自检：核对文件是否就位、composition 是否完整
+    dry-run    只打印将要写入的内容与目标路径，磁盘一个字节都不动
+    list       列出当前所有已安装 preset
+    diagnose   诊断：打印 DSH_HOME 的全部候选与判定依据（只读，排障用）
 
 .PARAMETER PresetId
     preset 目录名 / id，默认 pj-mode。
@@ -23,22 +24,35 @@
 .PARAMETER PresetName
     在 DSH 选择器里显示的名字，默认「破甲模式」。
 
+.PARAMETER DshHome
+    显式指定 DSH 数据目录。优先级最高（高于环境变量与全部自动探测）。
+
 .PARAMETER Yes
-    非交互确认，脚本不会弹出任何确认提示。
+    非交互模式：不弹任何询问。静默启动器（.vbs）会自动带上它。
 
 .NOTES
     写完必须重启 DSH 客户端并在【新会话】里选「破甲模式」才会生效 ——
     已在运行中的会话不会热切换 composition。
+
+    v1.1 变更：
+      1) 找不到 ~/.dsh 不再报错退出 —— 改为多来源自动探测（含 DSH Desktop
+         启动器里写死的 DSH_HOME），都不存在时按官方默认位置按需创建。
+      2) 只读动作（list / check / dry-run / diagnose）保证不创建任何目录，
+         脚本自身在退出前会断言这一点。
+      3) 新增 diagnose 动作，一条命令说清"到底装到哪、为什么"。
+      4) 新增 -DshHome 参数，手动指定数据目录。
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('install', 'uninstall', 'check', 'dry-run', 'list')]
+    [ValidateSet('install', 'uninstall', 'check', 'dry-run', 'list', 'diagnose')]
     [string]$Action = 'install',
 
     [string]$PresetId = 'pj-mode',
 
     [string]$PresetName = '破甲模式',
+
+    [string]$DshHome,
 
     [switch]$Yes
 )
@@ -53,6 +67,9 @@ $Script:AssetDir   = Join-Path $PSScriptRoot 'assets'
 $Script:CompoFile  = 'agent.cordis.yml'
 $Script:MetaFile   = 'preset.yml'
 
+# 只读动作：绝不落盘（见文件末尾 Assert-NoWrite）
+$Script:ReadOnlyActions = @('list', 'check', 'dry-run', 'diagnose')
+
 # ── 输出小工具（全 ASCII 标记，避免 Windows 中文控制台编码问题） ──────────────
 
 function Write-Step { param([string]$m) Write-Host "[*] $m" -ForegroundColor Cyan }
@@ -64,56 +81,249 @@ function Write-Banner {
     Write-Host ''
     Write-Host '  ============================================================' -ForegroundColor DarkCyan
     Write-Host '       DSH 破甲模式 一键安装器                                 ' -ForegroundColor Cyan
-    Write-Host '       DeepSeek Harness - Unlock Agent Preset                 ' -ForegroundColor DarkGray
+    Write-Host '       DeepSeek Harness - Unlock Agent Preset      v1.1       ' -ForegroundColor DarkGray
     Write-Host '  ============================================================' -ForegroundColor DarkCyan
     Write-Host ''
 }
 
 # ── 环境探测 ──────────────────────────────────────────────────────────────────
 
-function Get-DshHome {
+function Get-DshProcesses {
+    Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessName -match 'DSH|deepseek|harness' }
+}
+
+# 供 Add-DshCandidate 收集用
+$Script:CandList = $null
+
+function Test-LooksLikeDshHome {
     <#
-      解析优先级【逐字对齐官方 @deepseek-ai/dsh-home-paths 的 resolveDshHome()】：
-        1) $DSH_HOME（纯空白视为未设置，与官方一致）
-        2) ~/.dsh
-      官方源码（lib/index.js）：
-        const fromEnv = env.DSH_HOME
-        resolve(expandHome(configured ?? (fromEnv 非空 ? fromEnv : defaultDshHome())))
-      注意：官方【不】检查目录是否存在 —— 路径不存在也照样返回。
-      本机探测额外容忍"路径尚未创建"的情况：只要父目录在就算数，
-      因为用户可能刚装好 DSH 还没启动过，此时 .dsh 可能是空的甚至还没建。
-      绝不硬编码盘符 —— 用户机器上 DSH 可能不在 C 盘。
+      一个目录"像不像 DSH 数据目录"：含任意一个标志性子项即可。
+      纯只读（只 Test-Path），用于给候选加分，以及把 ~/.dsh-meow 这类
+      同名无关目录挡在候选表之外。
     #>
-    $envHome = $env:DSH_HOME
-    if ($envHome -and $envHome.Trim().Length -gt 0) {
-        # 官方此处不校验存在性；我们只在"确实存在"时直接采用，
-        # 否则继续往下走，最后统一给出可读的报错或采用它作为目标。
-        if (Test-Path -LiteralPath $envHome) {
-            return (Resolve-Path -LiteralPath $envHome).Path
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    foreach ($sub in @('.agent-presets', 'profiles', 'sessions', '.credentials.yaml', 'settings.yaml')) {
+        if (Test-Path -LiteralPath (Join-Path $Path $sub)) { return $true }
+    }
+    return $false
+}
+
+function Add-DshCandidate {
+    <#
+      登记一个候选 DSH 数据目录。同一个路径多次命中只保留最高分与对应来源。
+      纯只读：只做 Test-Path，绝不创建任何东西。
+    #>
+    param([string]$Path, [string]$Source, [int]$Rank)
+
+    if (-not $Path) { return }
+    $p = $Path.Trim().Trim('"')
+    if ($p.Length -eq 0) { return }
+
+    # 展开 %VAR% 与 ~ （官方 dsh-home-paths 也做这两件事）
+    $exp = [Environment]::ExpandEnvironmentVariables($p)
+    if ($exp.StartsWith('~')) {
+        $rest = $exp.Substring(1).TrimStart('\', '/')
+        if (-not $env:USERPROFILE) { return }
+        $exp = if ($rest.Length -gt 0) { Join-Path $env:USERPROFILE $rest } else { $env:USERPROFILE }
+    }
+    try { $full = [System.IO.Path]::GetFullPath($exp) } catch { return }
+
+    $exists = Test-Path -LiteralPath $full
+
+    # "像不像一个 DSH 数据目录"：有几个标志性子项就加分
+    $looks = Test-LooksLikeDshHome -Path $full
+    if ($looks) { $Rank += 5 }
+
+    foreach ($c in $Script:CandList) {
+        if ($c.Path -ieq $full) {
+            if ($Rank -gt $c.Rank) { $c.Rank = $Rank; $c.Source = $Source }
+            return
         }
-        # DSH_HOME 指向了尚未创建的目录：仍尊重它（用户显式指定），并确保建出来
-        New-Item -ItemType Directory -Path $envHome -Force | Out-Null
-        return (Resolve-Path -LiteralPath $envHome).Path
     }
 
-    $fallback = Join-Path $env:USERPROFILE '.dsh'
-    if (Test-Path -LiteralPath $fallback) { return $fallback }
+    [void]$Script:CandList.Add([pscustomobject]@{
+        Path            = $full
+        Source          = $Source
+        Rank            = $Rank
+        Exists          = $exists
+        LooksLikeDshHome= $looks
+    })
+}
 
-    throw "找不到 DSH 数据目录（$fallback 不存在）。`n请确认已安装并至少运行过一次 DeepSeek Harness，或手动指定：`n  `$env:DSH_HOME=`"D:\你的\dsh`"; .\unlock-dsh.ps1 install"
+function Get-DshHomeFromLaunchers {
+    <#
+      DSH Desktop 会在 %APPDATA%\<应用名>\host-commands\<profile>\bin\dsh.cmd 里
+      生成一个启动器，其中【写死了它实际使用的 DSH_HOME】：
+
+          set "DSH_HOME=C:\Users\xxx\.dsh"
+
+      这是本机上最接近"DSH 自己在用哪个目录"的静态证据 —— 用户在 DSH 里选过
+      自定义数据目录时，这里是唯一能自动读到的地方。NEXT / Beta 等通道的
+      userData 目录名不同，所以按通配扫描而不是写死 "DSH Desktop"。
+
+      welcome.cmd / welcome.ps1 里只是 echo 该变量，不作为来源。
+    #>
+    $result = New-Object System.Collections.ArrayList
+    $bases  = @($env:APPDATA, $env:LOCALAPPDATA) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+    foreach ($b in $bases) {
+        $patterns = @(
+            (Join-Path $b '*\host-commands\*\bin\dsh.cmd'),
+            (Join-Path $b '*\host-commands\*\generations\*\bin\dsh.cmd')
+        )
+        foreach ($pat in $patterns) {
+            Get-ChildItem -Path $pat -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    $txt = [System.IO.File]::ReadAllText($_.FullName)
+                    $m = [regex]::Match($txt, 'set\s+"DSH_HOME=(?<p>[^"]+)"')
+                    if ($m.Success) {
+                        [void]$result.Add([pscustomobject]@{
+                            Path   = $m.Groups['p'].Value
+                            Source = "DSH 启动器记录（$($_.FullName)）"
+                        })
+                    }
+                } catch { }
+            }
+        }
+    }
+    return @($result)
+}
+
+function Get-DshHomeCandidates {
+    <#
+      收集所有可能的 DSH 数据目录候选，按可信度排序。只读，不创建任何目录。
+
+      评分依据（分越高越可信）：
+        110  命令行 -DshHome 参数            用户显式指定
+        100  $env:DSH_HOME                   DSH 启动子进程时会注入，运行期最权威
+         90  DSH 启动器 dsh.cmd 里写死的       DSH Desktop 实际在用的目录
+         60  ~/.dsh                          官方默认（dsh-home-paths 的 defaultDshHome）
+         55  ~/.dsh-beta                     NEXT Beta 通道默认
+         40  主目录下其它 .dsh* 目录           历史遗留 / 自定义
+        +5   含 .agent-presets / profiles / sessions 等标志子项（像真 DSH home）
+    #>
+    param([string]$Explicit)
+
+    $Script:CandList = New-Object System.Collections.ArrayList
+
+    if ($Explicit) {
+        Add-DshCandidate -Path $Explicit -Source '命令行 -DshHome 参数' -Rank 110
+    }
+
+    if ($env:DSH_HOME -and $env:DSH_HOME.Trim().Length -gt 0) {
+        Add-DshCandidate -Path $env:DSH_HOME -Source '环境变量 $env:DSH_HOME' -Rank 100
+    }
+
+    foreach ($l in (Get-DshHomeFromLaunchers)) {
+        Add-DshCandidate -Path $l.Path -Source $l.Source -Rank 90
+    }
+
+    if ($env:USERPROFILE) {
+        Add-DshCandidate -Path (Join-Path $env:USERPROFILE '.dsh')      -Source '官方默认位置 ~/.dsh'    -Rank 60
+        Add-DshCandidate -Path (Join-Path $env:USERPROFILE '.dsh-beta') -Source 'NEXT Beta 通道默认 ~/.dsh-beta' -Rank 55
+
+        # 官方名（.dsh / .dsh-beta）无论存不存在都登记；其它 .dsh* 只有"真的像 DSH home"
+        # 才登记 —— 否则 ~/.dsh-meow（meow-memory 的）、~/.dsh-backup 之类会污染候选表，
+        # 让本来只有一个真数据目录的机器误报「检测到多个疑似 DSH 数据目录」。
+        Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like '.dsh*' -and $_.Name -ne '.dsh' -and $_.Name -ne '.dsh-beta' } |
+            Where-Object { Test-LooksLikeDshHome -Path $_.FullName } |
+            ForEach-Object { Add-DshCandidate -Path $_.FullName -Source "主目录下的 $($_.Name)" -Rank 40 }
+    }
+
+    return @($Script:CandList |
+        Sort-Object -Property @{ Expression = 'Rank'; Descending = $true },
+                              @{ Expression = 'Exists'; Descending = $true },
+                              @{ Expression = 'Path'; Descending = $false })
+}
+
+function Resolve-DshHome {
+    <#
+      从候选里挑一个。规则（前两条【不检查目录是否存在】）：
+        ① 命令行 -DshHome       —— 用户显式指定，无条件尊重
+        ② $env:DSH_HOME 非空    —— 与官方 dsh-home-paths 的 resolveDshHome() 同语义：
+                                   有值就用，即使目录还不存在（用户可能刚指定、还没启动过）
+        ③ 存在的候选里分最高的   —— 自动探测
+        ④ 都不存在 → 取分最高的（官方默认 ~/.dsh），交给调用方按需创建
+      永不 throw（旧版在这里 throw，导致没启动过 DSH 的用户直接 exit 1 卡死）。
+    #>
+    param([string]$Explicit)
+
+    $cands    = @(Get-DshHomeCandidates -Explicit $Explicit)
+    if ($cands.Count -eq 0) {
+        throw '无法确定 DSH 数据目录：连 ~/.dsh 都推不出来（$env:USERPROFILE 为空？）。请用 -DshHome 显式指定。'
+    }
+    $existing = @($cands | Where-Object { $_.Exists })
+
+    # ① 显式参数
+    if ($Explicit) {
+        $hit = $cands | Where-Object { $_.Rank -ge 110 } | Select-Object -First 1
+        if ($hit) {
+            return [pscustomobject]@{ Candidates = $cands; Chosen = $hit; Ambiguous = $false; ExistingCount = $existing.Count }
+        }
+    }
+
+    # ② 环境变量（官方语义：有值即用）
+    if ($env:DSH_HOME -and $env:DSH_HOME.Trim().Length -gt 0) {
+        $hit = $cands | Where-Object { $_.Rank -ge 100 } | Select-Object -First 1
+        if ($hit) {
+            return [pscustomobject]@{ Candidates = $cands; Chosen = $hit; Ambiguous = $false; ExistingCount = $existing.Count }
+        }
+    }
+
+    # ③④ 自动探测
+    if ($existing.Count -gt 0) {
+        $chosen = $existing[0]
+    } else {
+        $chosen = $cands[0]
+    }
+
+    # 什么时候算"不确定"：多个存在的候选，且最高分的那个还不到"DSH 启动器记录"的把握
+    $ambiguous = ($existing.Count -gt 1) -and ($chosen.Rank -lt 90)
+
+    return [pscustomobject]@{
+        Candidates    = $cands
+        Chosen        = $chosen
+        Ambiguous     = $ambiguous
+        ExistingCount = $existing.Count
+    }
+}
+
+function Show-DshHomeCandidates {
+    param($Info)
+    Write-Host '  ── DSH_HOME 候选 ─────────────────────────────────────' -ForegroundColor DarkCyan
+    foreach ($c in $Info.Candidates) {
+        $mark  = if ($c.Path -ieq $Info.Chosen.Path) { '  [选中]' } else { '        ' }
+        $ex    = if ($c.Exists) { '存在' } else { '不存在' }
+        $color = if ($c.Path -ieq $Info.Chosen.Path) { 'Cyan' } else { 'DarkGray' }
+        Write-Host ("  {0} {1,-58} {2}  (分 {3})" -f $mark, $c.Path, $ex, $c.Rank) -ForegroundColor $color
+        Write-Host ("            来源：{0}" -f $c.Source) -ForegroundColor DarkGray
+    }
+    Write-Host ''
 }
 
 function Get-PresetRoot {
-    param([string]$DshHome)
+    param([string]$DshHome, [switch]$Create)
     $root = Join-Path $DshHome '.agent-presets'
-    if (-not (Test-Path $root)) {
+    if ($Create -and -not (Test-Path -LiteralPath $root)) {
         New-Item -ItemType Directory -Path $root -Force | Out-Null
+        Write-Step "已创建 preset 根目录：$root"
     }
     return $root
 }
 
-function Get-DshProcesses {
-    Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessName -match 'DSH|deepseek|harness' }
+function Test-Interactive {
+    <#
+      能不能安全地提问？只要有任何一条"不可交互"的证据，就一律不问 ——
+      静默启动器（vbs 用 -Command 调起）与 CI 里 stdin 都是重定向的。
+    #>
+    if ($Yes) { return $false }
+    if ($env:DSH_UNLOCK_YES -eq '1') { return $false }
+    if ($env:DSH_UNLOCK_NONINTERACTIVE -eq '1') { return $false }
+    try { if ([Console]::IsInputRedirected) { return $false } } catch { return $false }
+    return $true
 }
 
 # ── 资源载入 ──────────────────────────────────────────────────────────────────
@@ -215,7 +425,7 @@ function Invoke-Uninstall {
 
     if (-not (Test-Path $targetDir)) {
         Write-Warn2 "未找到 $targetDir ，无需卸载。"
-        return
+        return $true
     }
 
     $compoPath = Join-Path $targetDir $Script:CompoFile
@@ -224,7 +434,7 @@ function Invoke-Uninstall {
         if ($head -notmatch [regex]::Escape($Script:MarkerLine)) {
             Write-Err2 "该目录不是本工具安装的（缺少 $Script:MarkerLine 标记），为安全起见不予删除。"
             Write-Warn2 "如确认要删，请手动删除：$targetDir"
-            return
+            return $false
         }
     }
 
@@ -233,6 +443,7 @@ function Invoke-Uninstall {
     Move-Item $targetDir $trash -Force
     Write-Ok "已卸载，原目录移动到：$trash"
     Write-Host "     （确认无误后可手动删除该备份目录）" -ForegroundColor DarkGray
+    return $true
 }
 
 function Invoke-Check {
@@ -263,6 +474,7 @@ function Invoke-Check {
     if ($fails -gt 0) {
         Write-Host ''
         Write-Err2 "自检未通过：文件缺失。请运行  install  后重试。"
+        Write-Warn2 '若你确信已安装过，很可能是装到了另一个数据目录 —— 运行  .\unlock-dsh.ps1 diagnose  查看全部候选。'
         return $false
     }
 
@@ -334,6 +546,12 @@ function Invoke-List {
     Write-Host ("  根目录：$PresetRoot")
     Write-Host ''
 
+    if (-not (Test-Path -LiteralPath $PresetRoot)) {
+        Write-Warn2 '该根目录不存在（这个 DSH 数据目录下还没装过任何 preset）。'
+        Write-Host '       → 若你已经在用 DSH，运行  .\unlock-dsh.ps1 diagnose  看它实际用的是哪个目录。' -ForegroundColor DarkGray
+        return
+    }
+
     $dirs = Get-ChildItem $PresetRoot -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notlike '_*' }
 
@@ -362,31 +580,140 @@ function Invoke-List {
     Write-Host ''
 }
 
+function Show-DshDiagnose {
+    <#
+      diagnose 动作的全部输出。目标是：用户把这段贴到 issue 里，作者一眼就能
+      判断"是装错目录了、还是根本没装成功、还是 DSH 读的地方不一样"。
+    #>
+    param($Info, [string]$PresetRoot)
+
+    Show-DshHomeCandidates -Info $Info
+
+    Write-Host '  ── 判定结论 ─────────────────────────────────────────' -ForegroundColor DarkCyan
+    $c = $Info.Chosen
+    Write-Host ("  选定数据目录 : " + $c.Path) -ForegroundColor Cyan
+    Write-Host ("  判定来源     : " + $c.Source)
+    Write-Host ("  目录是否存在 : " + $(if ($c.Exists) { '是' } else { '否' }))
+    Write-Host ("  像 DSH home  : " + $(if ($c.LooksLikeDshHome) { '是（含 profiles / sessions / .agent-presets 等）' } else { '否' }))
+    Write-Host ("  存在的候选数 : " + $Info.ExistingCount)
+    if ($Info.ExistingCount -gt 1) {
+        Write-Warn2 '本机有多个疑似 DSH 数据目录 —— 装错目录是"选择器里看不到破甲模式"最常见的原因。'
+        Write-Host '       → 用 -DshHome "正确路径" 重跑 install，例如：' -ForegroundColor Yellow
+        Write-Host '         .\unlock-dsh.ps1 install -DshHome "D:\your\dsh"' -ForegroundColor Yellow
+    } elseif ($Info.ExistingCount -eq 0) {
+        Write-Warn2 '一个都不存在 —— 说明本机可能还没成功装过 DSH，或 DSH 用的是便携版自带的相对目录。'
+    }
+
+    Write-Host ''
+    Write-Host '  ── preset 根目录 ────────────────────────────────────' -ForegroundColor DarkCyan
+    Write-Host ("  " + $PresetRoot + "  →  " + $(if (Test-Path -LiteralPath $PresetRoot) { '存在' } else { '不存在' }))
+    $pj = Join-Path (Join-Path $PresetRoot $PresetId) $Script:CompoFile
+    Write-Host ("  " + $pj + "  →  " + $(if (Test-Path -LiteralPath $pj) { '存在' } else { '不存在' }))
+
+    Write-Host ''
+    Write-Host '  ── 运行中的 DSH 进程 ────────────────────────────────' -ForegroundColor DarkCyan
+    $procs = @(Get-DshProcesses)
+    if ($procs.Count -eq 0) {
+        Write-Host '  （未检测到 DSH 进程）'
+    } else {
+        foreach ($p in ($procs | Select-Object -First 8)) {
+            $path = ''
+            try { $path = $p.Path } catch { }
+            Write-Host ("  " + $p.ProcessName + "  pid=" + $p.Id + "  " + $path) -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ''
+    Write-Host '  ── 手工覆盖 ─────────────────────────────────────────' -ForegroundColor DarkCyan
+    Write-Host '  若上表选错了目录，用参数指定后重装：'
+    Write-Host '    .\unlock-dsh.ps1 install -DshHome "你的\DSH数据目录"'
+    Write-Host ''
+}
+
+# ── 只读动作的自证：什么都没建 ────────────────────────────────────────────────
+
+function Assert-NoWrite {
+    param([string]$Root, [bool]$ExistedBefore)
+    if ($ExistedBefore) { return }
+    if (Test-Path -LiteralPath $Root) {
+        Write-Err2 "内部缺陷：只读动作竟然创建了 $Root —— 请把这段输出反馈给作者。"
+        exit 2
+    }
+}
+
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
 Write-Banner
 
+$readOnly = ($Script:ReadOnlyActions -contains $Action)
+
 try {
-    $dshHome    = Get-DshHome
-    $presetRoot = Get-PresetRoot -DshHome $dshHome
+    $info       = Resolve-DshHome -Explicit $DshHome
+    $chosen     = $info.Chosen
+    $dshHome    = $chosen.Path
+    $presetRoot = Join-Path $dshHome '.agent-presets'
+
+    # 进入时的状态 —— 只读动作结束时用它自证"没建目录"
+    $rootExistedBefore = Test-Path -LiteralPath $presetRoot
 
     Write-Host "  DSH_HOME     : $dshHome"
+    Write-Host "  判定来源      : $($chosen.Source)"
+    if (-not $chosen.Exists) {
+        Write-Warn2 '该目录当前不存在 —— 首次安装 DSH / 还没启动过时属正常，install 会按需创建。'
+    }
     Write-Host "  preset 根目录 : $presetRoot"
     Write-Host "  preset id     : $PresetId"
     Write-Host "  显示名        : $PresetName"
     Write-Host ''
 
+    if ($Action -eq 'diagnose') {
+        Show-DshDiagnose -Info $info -PresetRoot $presetRoot
+        Assert-NoWrite -Root $presetRoot -ExistedBefore $rootExistedBefore
+        exit 0
+    }
+
+    # 只有"即将改盘"的 install 才允许打扰用户（见 README「非交互三不」）
+    if ($Action -eq 'install' -and $info.Ambiguous) {
+        Show-DshHomeCandidates -Info $info
+        if (Test-Interactive) {
+            $ans = Read-Host '  将安装到上表 [选中] 的目录。回车继续，或输入 n 取消'
+            if ($ans -match '^\s*[nN]') { Write-Warn2 '已取消，未做任何改动。'; exit 0 }
+        } else {
+            Write-Warn2 '非交互模式：直接采用上表 [选中] 的目录。'
+        }
+        Write-Host ''
+    }
+
+    # 写入类动作才建目录；只读动作绝不建
+    if (-not $readOnly) {
+        $null = Get-PresetRoot -DshHome $dshHome -Create
+    }
+
     switch ($Action) {
-        'list'      { Invoke-List -PresetRoot $presetRoot }
-        'check'     { [void](Invoke-Check -DshHome $dshHome -PresetRoot $presetRoot) }
-        'dry-run'   { Invoke-Install -DshHome $dshHome -PresetRoot $presetRoot -DryRun }
-        'install'   {
+        'list'    { Invoke-List -PresetRoot $presetRoot }
+        'check'   { [void](Invoke-Check -DshHome $dshHome -PresetRoot $presetRoot) }
+        'dry-run' { Invoke-Install -DshHome $dshHome -PresetRoot $presetRoot -DryRun }
+        'install' {
             Invoke-Install -DshHome $dshHome -PresetRoot $presetRoot
             Write-Host ''
             [void](Invoke-Check -DshHome $dshHome -PresetRoot $presetRoot)
+            if ($info.Ambiguous) {
+                Write-Host ''
+                Write-Warn2 "本机检测到 $($info.ExistingCount) 个疑似 DSH 数据目录，本次自动选了 $($info.Chosen.Path)。"
+                Write-Host "      若重启 DSH 后选择器里仍看不到「$PresetName」，说明装错了目录 —— " -ForegroundColor Yellow
+                Write-Host '      先跑  .\unlock-dsh.ps1 diagnose  看判定，再用 -DshHome 指定正确目录重装。' -ForegroundColor Yellow
+            }
         }
-        'uninstall' { Invoke-Uninstall -PresetRoot $presetRoot }
+        'uninstall' {
+            if (-not (Invoke-Uninstall -PresetRoot $presetRoot)) {
+                Write-Host ''
+                Write-Host '  安全闸已拒绝删除，未做任何改动（退出码 3）。' -ForegroundColor DarkGray
+                exit 3
+            }
+        }
     }
+
+    if ($readOnly) { Assert-NoWrite -Root $presetRoot -ExistedBefore $rootExistedBefore }
 
     exit 0
 }
@@ -394,6 +721,7 @@ catch {
     Write-Host ''
     Write-Err2 $_.Exception.Message
     Write-Host ''
+    Write-Host '  排障：先跑  .\unlock-dsh.ps1 diagnose  看它探测到了什么。' -ForegroundColor DarkGray
     Write-Host '  若问题持续，请把以上完整输出反馈给作者。' -ForegroundColor DarkGray
     exit 1
 }

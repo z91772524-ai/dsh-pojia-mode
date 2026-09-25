@@ -7,7 +7,7 @@ rem  DSH Unlock Mode - One-click installer (double-click me)
 rem
 rem  Usage:
 rem    Double-click       -> install + self-check
-rem    With an argument   -> unlock-dsh.bat check|uninstall|dry-run|list
+rem    With an argument   -> unlock-dsh.bat check|uninstall|dry-run|list|diagnose
 rem
 rem  NOTE: This file is intentionally ASCII-only.
 rem  cmd.exe parses .bat in the OEM codepage, so non-ASCII

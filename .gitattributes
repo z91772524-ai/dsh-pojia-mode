@@ -1,10 +1,17 @@
-﻿# 统一换行，避免 Windows/Linux 检出差异导致 SHA256 对不上
+# 统一换行，避免 Windows/Linux 检出差异导致 SHA256 对不上
 * text=auto eol=lf
 
-# 二进制/敏感编码文件：绝不转换
+# 二进制文件：绝不转换
 *.png  binary
 *.zip  binary
+
+# 下面这些文件出现在 SHA256SUMS.txt 里，校验的是"用户下载拿到的字节"，
+# 因此必须禁止任何行尾转换 —— 否则 blob 与本地文件会差出 CRLF/LF，
+# 下载者算出来的哈希永远对不上（pojia-next 踩过这个坑）。
 *.ps1  -text
 *.bat  -text
 *.vbs  -text
 *.tmpl -text
+README.md      -text
+LICENSE        -text
+SHA256SUMS.txt -text

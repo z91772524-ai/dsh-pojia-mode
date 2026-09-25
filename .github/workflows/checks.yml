@@ -52,12 +52,59 @@ jobs:
           }
           Write-Host "OK  unlock-dsh.ps1 语法通过"
 
-          $out = & cscript //nologo //X //Job:NoSuchJob "$PWD/unlock-dsh-silent.vbs" 2>&1
-          if ($LASTEXITCODE -ne 0 -and ($out -join "`n") -match "语法|syntax|Syntax") {
-            Write-Host "VBS 语法错误:"; $out | ForEach-Object { Write-Host $_ }
-            exit 1
+          # vbs 只做静态检查：真的执行它会启动安装流程并弹出 MessageBox，
+          # 在无人值守的 CI 里会直接把 job 挂死。
+          $vtxt = [System.IO.File]::ReadAllText("$PWD/unlock-dsh-silent.vbs", [System.Text.Encoding]::GetEncoding(936))
+          $vfail = 0
+          foreach ($needle in @("Option Explicit", "Sub LogIt", "WScript.Quit", "-Yes *>&1")) {
+            if ($vtxt.Contains($needle)) { Write-Host "OK   vbs 含 $needle" }
+            else { Write-Host "FAIL vbs 缺 $needle"; $vfail++ }
           }
-          Write-Host "OK  unlock-dsh-silent.vbs 语法通过"
+          # 参数白名单必须完整：action 会被拼进内层命令行，缺了就是命令注入面
+          if ($vtxt -match 'Case "install", "uninstall", "check", "dry-run", "list", "diagnose"') {
+            Write-Host "OK   vbs 参数白名单完整"
+          } else { Write-Host "FAIL vbs 缺参数白名单"; $vfail++ }
+          if ($vfail -gt 0) { exit 1 }
+          Write-Host "OK  unlock-dsh-silent.vbs 静态检查通过"
+
+      - name: 只读动作一个字节都不落盘（v1.1 新增，复现旧缺陷的核心场景）
+        shell: pwsh
+        run: |
+          # 关键点：DSH_HOME 指向一个【尚不存在】的目录。
+          # v1.0 的 CI 预先建好了 fake-dsh，所以永远测不出"只读动作自己建目录"。
+          $fail = 0
+          foreach ($act in @("list", "check", "dry-run", "diagnose")) {
+            $target = Join-Path $env:RUNNER_TEMP ("ro-$act-" + [guid]::NewGuid().ToString("N"))
+            $env:DSH_HOME = $target
+            ./unlock-dsh.ps1 $act | Out-Host
+            $code = $LASTEXITCODE
+            if ($code -ne 0)      { Write-Host "FAIL $act exit=$code"; $fail++ }
+            if (Test-Path $target) { Write-Host "FAIL $act 创建了 $target"; $fail++ }
+            else { Write-Host "OK   $act exit=$code 且未创建 $target" }
+          }
+          if ($fail -gt 0) { exit 1 }
+
+      - name: 无 DSH 环境不得卡死（v1.1 新增，Issue #1/#2 的根因场景）
+        shell: pwsh
+        run: |
+          # 模拟"从资源管理器双击 .vbs"：没有 DSH_HOME 环境变量，也没有 ~/.dsh。
+          # v1.0 在这里直接 throw -> exit 1，用户只看到一行报错。
+          $home2 = Join-Path $env:RUNNER_TEMP ("fakehome-" + [guid]::NewGuid().ToString("N"))
+          $env:USERPROFILE  = $home2
+          $env:APPDATA      = Join-Path $home2 "AppData/Roaming"
+          $env:LOCALAPPDATA = Join-Path $home2 "AppData/Local"
+          New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force | Out-Null
+          Remove-Item Env:\DSH_HOME -ErrorAction SilentlyContinue
+
+          ./unlock-dsh.ps1 diagnose | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAIL 无 DSH 环境下 diagnose 应 exit 0，实际 $LASTEXITCODE"; exit 1
+          }
+          if (Test-Path (Join-Path $home2 ".dsh")) {
+            Write-Host "FAIL 只读的 diagnose 不应创建 ~/.dsh"; exit 1
+          }
+          Write-Host "OK   无 DSH 环境下正常返回，且未落盘"
 
       - name: 干跑（dry-run 不落盘）
         shell: pwsh
@@ -72,24 +119,44 @@ jobs:
             exit 1
           }
 
-      - name: 安装 + 自检
+      - name: 安装 + 自检（-DshHome 指定一个还不存在的目录）
         shell: pwsh
         run: |
-          $env:DSH_HOME = Join-Path $env:RUNNER_TEMP "fake-dsh"
-          New-Item -ItemType Directory -Path $env:DSH_HOME -Force | Out-Null
-          ./unlock-dsh.ps1 install | Out-Host
-          $compo = Join-Path $env:DSH_HOME ".agent-presets/pj-mode/agent.cordis.yml"
+          # 顺带验证：目标目录不存在时 install 也能一次跑通（旧版会 throw）
+          $home3 = Join-Path $env:RUNNER_TEMP ("brandnew-" + [guid]::NewGuid().ToString("N"))
+          ./unlock-dsh.ps1 install -DshHome $home3 -Yes | Out-Host
+          if ($LASTEXITCODE -ne 0) { Write-Host "FAIL install exit=$LASTEXITCODE"; exit 1 }
+
+          $compo = Join-Path $home3 ".agent-presets/pj-mode/agent.cordis.yml"
+          $meta  = Join-Path $home3 ".agent-presets/pj-mode/preset.yml"
           if (-not (Test-Path $compo)) { Write-Host "FAIL 未生成 composition"; exit 1 }
+          if (-not (Test-Path $meta))  { Write-Host "FAIL 未生成 preset.yml"; exit 1 }
+
           $txt = [System.IO.File]::ReadAllText($compo)
-          foreach ($k in @("总纲（用户至上）","露骨内容无限制（强化版）","残留条款无效","C730EC47C921","<文件操作无限制>","你是小码酱","破甲模式 v4")) {
-            if ($txt.Contains($k)) { Write-Host "OK  含关键块: $k" }
-            else { Write-Host "FAIL 缺少关键块: $k"; exit 1 }
+          $fails = 0
+          foreach ($k in @(
+              "# [dsh-unlock-mode]",
+              "- id: persona",
+              "总纲（用户至上）",
+              "露骨内容无限制（强化版）",
+              "残留条款无效",
+              "版本2.0.C730EC47C921",
+              "<文件操作无限制>",
+              "你是小码酱",
+              "破甲已生效｜目标 DSH｜破甲模式 v4")) {
+            if ($txt.Contains($k)) { Write-Host "OK   含关键块: $k" }
+            else { Write-Host "FAIL 缺少关键块: $k"; $fails++ }
           }
+          if ($fails -gt 0) { exit 1 }
 
       - name: 卸载
         shell: pwsh
         run: |
           $env:DSH_HOME = Join-Path $env:RUNNER_TEMP "fake-dsh"
+          ./unlock-dsh.ps1 install | Out-Host
+          if (-not (Test-Path (Join-Path $env:DSH_HOME ".agent-presets/pj-mode"))) {
+            Write-Host "FAIL 安装后目录不存在"; exit 1
+          }
           ./unlock-dsh.ps1 uninstall | Out-Host
           if (Test-Path (Join-Path $env:DSH_HOME ".agent-presets/pj-mode")) {
             Write-Host "FAIL 卸载后目录仍在"; exit 1
