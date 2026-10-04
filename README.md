@@ -1,6 +1,6 @@
-# DSH 破甲模式 v1.1
+# DSH 破甲模式 v1.2
 
-**双击一个文件，你的 DSH（DeepSeek Harness）就多出一个「破甲模式」** —— 不改 DSH 一字节代码、不动官方目录、升级不丢；零依赖（系统自带 PowerShell）、改前自动备份、装完当场可自证、随时可一键卸载。
+给 DSH（DeepSeek Harness）安装一个「破甲模式」Agent Preset。只修改用户数据与 profile 配置，不修改客户端安装目录；系统自带 PowerShell 即可运行，修改前自动备份。
 
 [![Release](https://img.shields.io/github/v/release/z91772524-ai/dsh-pojia-mode?label=release&color=2ea043)](https://github.com/z91772524-ai/dsh-pojia-mode/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -11,8 +11,9 @@
 [![黑框](https://img.shields.io/badge/双击无黑框-vbs%20SW__HIDE-success)](#两个入口)
 
 > ### 当前状态
-> **v1.1 已发布**，修的是「装完在 DSH 里看不到 / 双击一闪而过」这一类问题。
-> 如果你之前遇到过 —— 大概率就是它。详见 [v1.1 修了什么](#v11-修了什么)。
+> **v1.2 兼容现代 profile 注册方式（已在桌面版 `0.2.0-rc.2` 验证）**：该版本不扫描 `.agent-presets`，仅写文件不会显示模式。安装器现在会在用户的 `profiles/<profile>/cordis.patch.yml` 中注册预设，并把旧 `dsh-workflow-worker-thread` 替换为 `dsh-workflow-ptc`。默认优先 `desktop`，可用 `-Profile web` 指定其他 profile。
+>
+> `check` 检查文件与 profile 注册是否一致，异常时返回非零退出码；它不调用模型，回执口令仅用于确认 persona 被加载，不能证明模型行为或权限限制已经改变。
 
 > ## ⚠️ 免责声明（务必先读）
 > **本项目仅用于学习交流，无不良引导。若他人使用本项目从事任何违法、违规或侵权行为，与作者没有任何关系，全部后果由使用者自行承担。**
@@ -26,12 +27,12 @@
 
 ## 为什么值得一试
 
-- 🎯 **零侵入** —— 只往 `$DSH_HOME\.agent-presets\` 写一份自包含 preset，**官方 preset 目录一字节不碰**；升级 DSH 你的破甲模式还在
+- 🎯 **不改安装目录** —— 保存 preset，并在现代版的用户 profile patch 中注册；已有设置保留，修改前备份
 - 📦 **零依赖、零联网** —— 系统自带 PowerShell 即可，不需要 Node / Python / 管理员权限，不发起任何网络请求，断网也能跑
 - 🖱 **双击无黑框** —— 附 `.vbs` 静默启动器（`SW_HIDE`），实测 `cmd.exe` 出现次数 **0**；跑完弹窗告诉你结果，不像 bat 那样挂着窗口等你按键
 - 🧭 **自己找得到 DSH 在哪** —— 数据目录探测覆盖 4 类来源（含 DSH Desktop 启动器里写死的 `DSH_HOME`）；一个都找不到也不会报错退出，而是按官方默认位置建
-- 🩺 **装完能自证 / 装错了能说清** —— `check` 核对 9 个关键块；`diagnose` 一条命令打印"它到底装到哪、为什么是那里"
-- 🔄 **可回滚** —— 卸载 = 移到 `_uninstalled-*` 备份目录（不直删）；覆盖安装自动备份旧版为 `.bak-时间戳`
+- 🩺 **检查文件与注册** —— `check` 核对关键块与 profile 注册；`diagnose` 打印数据目录和注册状态
+- 🔄 **可回滚** —— 卸载先移除管理的 profile 注册块，再把 preset 移到 `_uninstalled-*` 备份目录；修改 profile 前保存 `.bak-unlock-时间戳`
 - 🛡 **不误删别人的东西** —— 目录里没有本工具标记就**拒绝删除**，防止手滑干掉别人的 preset
 - 🔍 **可以先看再动手** —— `dry-run` 只打印将要写入什么，**磁盘一个字节都不动**（只读动作脚本自身会断言这一点）
 
@@ -69,6 +70,8 @@
 .\unlock-dsh.ps1 list        # 列出当前所有 preset
 .\unlock-dsh.ps1 diagnose    # 诊断：打印 DSH_HOME 的全部候选与判定依据（只读）
 .\unlock-dsh.ps1 uninstall   # 卸载（移到 _uninstalled- 备份目录）
+.\unlock-dsh.ps1 install -Profile desktop  # 只注册桌面 profile
+.\unlock-dsh.ps1 install -Profile web      # 只注册 Web profile
 ```
 
 自定义名字与 id：
@@ -135,14 +138,29 @@ persona 共 **5182 字符**，七块齐全：
 
 ## 原理（为什么它这么轻）
 
-DSH 的 preset 加载器扫描两个根：
+现代版 DSH 通过普通 Cordis 插件行注册 preset，不扫描 preset 目录。安装器保存模板到 `.agent-presets/<id>/`，同时在所选用户 profile 的 `cordis.patch.yml` 中添加带管理标记的 `insert` 块：
+
+```yaml
+- insert:
+    - id: unlock-preset-pj-mode
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: pj-mode
+        name: 破甲模式
+        order: 5
+        plugins: # 此处嵌入完整 composition 列表
+```
+
+安装时保留该文件中的其他设置；重复安装替换本工具的块，不重复注册。卸载只移除该块。若外部配置编辑器重写 YAML 并移除了管理标记，安装器会报错，避免重复定义或误删配置。
+
+旧版目录扫描布局（未发现现代 Web bundle profile 时的兼容回退）：
 
 | 根 | 说明 |
 |---|---|
 | `$DSH_HOME\.agent-presets\<id>\` | **用户自建**，升级 DSH 不会被覆盖 ← 本工具写这里 |
 | 部署目录下 `…\dsh-agent-presets\presets\<id>\` | 官方自带，**升级会覆盖，不要写** |
 
-关键点：一份 `agent.cordis.yml` 里所有 `name:` 都是 **npm 包名**（如 `@deepseek-ai/dsh-persona`），**不引用任何本地文件路径**。所以本工具**自带整份 composition**，不需要去定位、复制或修改官方的 `standard` preset —— 官方目录**一字节都不碰**。
+composition 中的 `name:` 使用 npm 包名（如 `@deepseek-ai/dsh-persona`）。现代 profile 安装时会适配已知的 workflow 插件改名；其他版本仍需确认客户端提供相应插件。没有发现现代 profile 时，自检会明确提示仅验证了旧版文件布局。
 
 ```
 dsh-pojia-mode/
@@ -180,7 +198,7 @@ dsh-pojia-mode/
 先跑 `.\unlock-dsh.ps1 diagnose`。
 - 若它列出**多个存在的候选目录** → 装错目录了，用 `-DshHome "正确路径"` 重装。
 - 若 `preset 根目录 … 不存在` → 根本没装成功，重新跑一次 `install`。
-- 都不是 → 完全退出 DSH（含托盘）再重开。列表是启动时扫描的。
+- 现代版还要确认 `check` 报告 profile 注册一致；若缺少注册，重新运行 v1.2 的 `install`。完整退出 DSH（含托盘）再重开，用新会话确认加载结果。
 
 **Q：双击一闪而过 / 只看到一行报错**
 v1.1 起不该再发生。若仍有，跑 `.\unlock-dsh.ps1 diagnose` 把输出贴到 Issues。
@@ -201,17 +219,16 @@ v1.1 起不该再发生。若仍有，跑 `.\unlock-dsh.ps1 diagnose` 把输出�
 
 ## 兼容性
 
-| 部署形态 | profile | preset 根 | 支持 |
+| 部署形态 | profile | 注册位置 / 说明 | 支持 |
 |---|---|---|---|
-| DSH Desktop（社区桌面版） | `desktop` | `$DSH_HOME\.agent-presets` | ✅ |
-| DSH NEXT（实验通道） | `desktop` | 同稳定版共用 `~/.dsh`（自定义目录也能探测到） | ✅ |
-| DSH Beta 通道 | — | `~/.dsh-beta` | ✅（自动探测） |
-| **官方 Web 版**（`dsh web`） | `web` | `$DSH_HOME\.agent-presets` | ✅ |
-| headless / tui / 自建 | 任意 | 同上 | ✅ |
+| DSH Desktop `0.2.0-rc.2` | `desktop` | `profiles/desktop/cordis.patch.yml` | 已验证注册与加载 |
+| 现代 Web bundle profile | `web` / 自定义 | `profiles/<名称>/cordis.patch.yml`，用 `-Profile` 指定 | 同注册方式，版本需核验 |
+| NEXT / Beta / 旧版 | 按部署配置 | 数据目录可探测；没有现代 profile 时回退 `.agent-presets` | 未验证全部通道 |
+| headless / tui / 自建 | 任意 | 仅自动注册含 `dsh-web-app` bundle 的 profile | 不保证其他 bundle 支持 |
 | Windows 10 / 11 | — | — | ✅ |
 | PowerShell 5.1（系统自带）/ 7+ | — | — | ✅ |
 
-**为什么通吃**：`@deepseek-ai/dsh-agent-presets` 用 `dshHomePath('.agent-presets')` 定位根目录，而 `dsh-home-paths` 的解析规则是 **`$DSH_HOME` → 否则 `~/.dsh`** —— 与当前跑哪个 profile **无关**。装一次，桌面版和 Web 版共享同一个「破甲模式」。
+**现代版需要按 profile 注册**：数据目录按 `$DSH_HOME` 或 `~/.dsh` 解析，但桌面与 Web profile 有各自的 patch。默认优先安装到 `desktop`；需要 Web 模式时另运行 `install -Profile web`。旧版扫描目录方式仅作为兼容回退，不能视为所有版本通用。
 
 ## 卸载 / 回滚
 
@@ -219,7 +236,13 @@ v1.1 起不该再发生。若仍有，跑 `.\unlock-dsh.ps1 diagnose` 把输出�
 .\unlock-dsh.ps1 uninstall
 ```
 
-目录会被移到 `$DSH_HOME\.agent-presets\_uninstalled-pj-mode-<时间戳>\`。彻底删除就直接删那个目录。DSH 下次启动就不再列出该 preset，**其余一切不受影响**。
+所选 profile 中的管理注册块会被移除，preset 文件移到 `$DSH_HOME\.agent-presets\_uninstalled-pj-mode-<时间戳>\`。如果曾用 `-Profile` 在其他 profile 注册过，请也为那些 profile 执行 `uninstall -Profile <名称>`。profile 配置的修改前备份留在原文件旁。
+
+## 开发验证
+
+`powershell -NoProfile -ExecutionPolicy Bypass -File tests/installer.ps1` 在临时数据目录验证只读动作、重复安装、缺少注册时的退出码、备份和卸载；也可在 PowerShell 7 中执行。
+
+`tests/validate-dsh.mjs` 使用安装包自带的加载器验证 YAML、有效 preset 列表及插件可解析性。通过设置 `ELECTRON_RUN_AS_NODE=1`，用客户端 exe 加 `--expose-internals` 执行此脚本，后接安装目录和 profile 目录。附加 `--boot` 时，会复制 profile 到临时数据目录并挂载预设，验证运行时加载状态；原 profile 保持只读。
 
 ## 交流 & 支持
 

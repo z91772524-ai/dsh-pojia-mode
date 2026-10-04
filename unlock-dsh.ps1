@@ -6,9 +6,9 @@
     安装后在 DSH 的 preset 选择器里会多出一个「破甲模式」，选中它新建会话即生效。
     完整退出 DSH 后重开、再新建会话即可在列表里看到。
 
-    原理：向 $DSH_HOME\.agent-presets\<id>\ 写入一份自包含的 Cordis composition
-    （agent.cordis.yml + preset.yml）。该文件不依赖任何外部路径，全部能力来自
-    DSH 自带插件包，因此不需要定位或修改部署自带的 preset。
+    原理：保存 composition，并在现代版的 profiles\<profile>\cordis.patch.yml
+    中插入 @deepseek-ai/dsh-agent-preset 注册行；旧版仍使用 .agent-presets。
+    不修改客户端安装目录，修改 profile 配置前自动备份。
 
 .PARAMETER Action
     install    安装 / 覆盖安装（默认）
@@ -30,6 +30,9 @@
 .PARAMETER Yes
     非交互模式：不弹任何询问。静默启动器（.vbs）会自动带上它。
 
+.PARAMETER Profile
+    只注册到指定 profile（如 desktop 或 web）；默认优先 desktop，其次为现有 Web bundle profiles。
+
 .NOTES
     写完必须重启 DSH 客户端并在【新会话】里选「破甲模式」才会生效 ——
     已在运行中的会话不会热切换 composition。
@@ -50,9 +53,13 @@ param(
 
     [string]$PresetId = 'pj-mode',
 
+    [ValidatePattern('^[^\r\n]+$')]
     [string]$PresetName = '破甲模式',
 
     [string]$DshHome,
+
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]*$')]
+    [string]$Profile,
 
     [switch]$Yes
 )
@@ -81,7 +88,7 @@ function Write-Banner {
     Write-Host ''
     Write-Host '  ============================================================' -ForegroundColor DarkCyan
     Write-Host '       DSH 破甲模式 一键安装器                                 ' -ForegroundColor Cyan
-    Write-Host '       DeepSeek Harness - Unlock Agent Preset      v1.1       ' -ForegroundColor DarkGray
+    Write-Host '       DeepSeek Harness - Unlock Agent Preset      v1.2       ' -ForegroundColor DarkGray
     Write-Host '  ============================================================' -ForegroundColor DarkCyan
     Write-Host ''
 }
@@ -171,6 +178,7 @@ function Get-DshHomeFromLaunchers {
     foreach ($b in $bases) {
         $patterns = @(
             (Join-Path $b '*\host-commands\*\bin\dsh.cmd'),
+            (Join-Path $b '@deepseek-ai\*\host-commands\*\bin\dsh.cmd'),
             (Join-Path $b '*\host-commands\*\generations\*\bin\dsh.cmd')
         )
         foreach ($pat in $patterns) {
@@ -314,6 +322,116 @@ function Get-PresetRoot {
     return $root
 }
 
+# 0.2.x 的注册表读取 profile 插件声明，不扫描 .agent-presets。
+function Get-PresetProfiles {
+    param([string]$HomePath)
+    $profilesDir = Join-Path $HomePath 'profiles'
+    if (-not (Test-Path -LiteralPath $profilesDir)) {
+        if ($Profile) { throw "找不到 profile：$Profile（$profilesDir 不存在）" }
+        return
+    }
+    $found = @()
+    foreach ($dir in (Get-ChildItem -LiteralPath $profilesDir -Directory)) {
+        if ($Profile -and $dir.Name -ne $Profile) { continue }
+        $manifestPath = Join-Path $dir.FullName 'package.json'
+        if (-not (Test-Path -LiteralPath $manifestPath)) { continue }
+        $manifest = [System.IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
+        if (@($manifest.dsh.profile.bundles) -notcontains '@deepseek-ai/dsh-web-app') { continue }
+        $found += [pscustomobject]@{
+            Name = $dir.Name
+            PatchPath = Join-Path $dir.FullName 'cordis.patch.yml'
+        }
+    }
+    if ($Profile -and $found.Count -eq 0) {
+        throw "profile $Profile 不存在或未包含 @deepseek-ai/dsh-web-app bundle。"
+    }
+    if (-not $Profile) {
+        $desktop = @($found | Where-Object { $_.Name -eq 'desktop' })
+        if ($desktop.Count -gt 0) { return $desktop }
+    }
+    return $found
+}
+
+function Get-RegistrationPattern {
+    $escaped = [regex]::Escape($PresetId)
+    return "(?ms)^# \[dsh-unlock-mode:begin\] $escaped\r?\n.*?^# \[dsh-unlock-mode:end\] $escaped(?:\r?\n|$)"
+}
+
+function Build-Registration {
+    param([string]$Composition)
+    # JSON 字符串也是合法 YAML 标量，名字中的冒号和引号不会破坏 YAML。
+    $idScalar = ConvertTo-Json -InputObject $PresetId -Compress
+    $nameScalar = ConvertTo-Json -InputObject $PresetName -Compress
+    $rowScalar = ConvertTo-Json -InputObject ("unlock-preset-$PresetId") -Compress
+    $nested = (($Composition.TrimEnd() -split '\r?\n') | ForEach-Object { '          ' + $_ }) -join "`r`n"
+    return @"
+# [dsh-unlock-mode:begin] $PresetId
+- insert:
+    - id: $rowScalar
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: $idScalar
+        name: $nameScalar
+        description: "用户自定义 Agent Preset（dsh-pojia-mode）"
+        order: 5
+        plugins:
+$nested
+# [dsh-unlock-mode:end] $PresetId
+"@ + "`r`n"
+}
+
+function Get-ProfilePatchText {
+    param([string]$Path)
+    if (Test-Path -LiteralPath $Path) { return [System.IO.File]::ReadAllText($Path) }
+    return ''
+}
+
+function Update-RegistrationText {
+    param([string]$Text, [string]$Block, [switch]$Remove)
+    $pattern = Get-RegistrationPattern
+    $matches = [regex]::Matches($Text, $pattern)
+    if ($matches.Count -gt 1) { throw "发现多个 $PresetId 注册块，请先修复 profile 配置。" }
+    if ($matches.Count -eq 1) {
+        $m = $matches[0]
+        $replacement = if ($Remove) { '' } else { $Block }
+        $result = $Text.Substring(0, $m.Index) + $replacement + $Text.Substring($m.Index + $m.Length)
+        if (-not ($result -match '(?m)^\s*[^#\s]')) { $result += "[]`r`n" }
+        return $result
+    }
+    # 标记被编辑器去掉时，不盲目插入重复定义或删除未知配置。
+    $row = [regex]::Escape("unlock-preset-$PresetId")
+    if ($Text -match "(?m)^\s*-\s*id:\s*['`"]?$row['`"]?\s*$" -or
+        $Text -match ("(?m)^# \[dsh-unlock-mode:(?:begin|end)\] " + [regex]::Escape($PresetId) + '\s*$')) {
+        throw "profile 中已有 $PresetId 注册但管理标记不完整，请先检查配置，避免重复注册。"
+    }
+    if ($Remove) { return $Text }
+    # 空列表 [] 与块式列表不能并存；保留其前后的注释。
+    $body = $Text
+    $content = (($Text -split '\r?\n' | Where-Object { $_ -notmatch '^\s*(?:#.*)?$' }) -join "`n").Trim()
+    if ($content -match '^\[\s*\](?:[ \t]*#.*)?$') {
+        $body = [regex]::Replace($Text, '(?m)^[ \t]*\[[ \t]*\][ \t]*(#.*)?\r?$', '$1')
+    } elseif ($content.StartsWith('[')) {
+        throw '暂不支持非空的流式 YAML profile patch，请先转为块式列表。'
+    }
+    return $body.TrimEnd() + "`r`n" + $Block
+}
+
+function Save-ProfilePatch {
+    param([string]$Path, [string]$Before, [string]$After)
+    if ($Before -ceq $After) { return }
+    # 防止编辑器/热更新在我们读取后同时改写用户配置。
+    if ((Get-ProfilePatchText -Path $Path) -cne $Before) {
+        throw "profile 配置刚被其他程序修改，请重试：$Path"
+    }
+    if (Test-Path -LiteralPath $Path) {
+        $backup = "$Path.bak-unlock-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
+        Copy-Item -LiteralPath $Path -Destination $backup
+        Write-Step "profile 配置已备份：$backup"
+    }
+    Write-Atomic -Path $Path -Content $After
+    Write-Ok "已更新 profile 注册：$Path"
+}
+
 function Test-Interactive {
     <#
       能不能安全地提问？只要有任何一条"不可交互"的证据，就一律不问 ——
@@ -353,13 +471,20 @@ function Build-Composition {
     # 口令行：把模板里的默认口令替换成本次 preset 的口令
     $text = $text -replace '破甲已生效｜目标 DSH｜破甲模式 v4', $Script:UnlockTag
 
+    if ($Script:PresetProfiles.Count -gt 0) {
+        # 当前版把旧 worker-thread 插件替换为 workflow-ptc。
+        $text = $text.Replace('id: workflow-worker-thread', 'id: workflow-ptc')
+        $text = $text.Replace('@deepseek-ai/dsh-workflow-worker-thread', '@deepseek-ai/dsh-workflow-ptc')
+    }
+
     return $text
 }
 
 function Build-Meta {
     param([string]$Name)
+    $nameScalar = ConvertTo-Json -InputObject $Name -Compress
     return @"
-name: $Name
+name: $nameScalar
 description: 用户指令最高优先级的完整编码 Agent：v4 强化版政策正文 + 逐条覆盖层 + 文件操作中和块，放开内容尺度、命令执行、渗透 payload、逆向破解与文件操作限制，并附「破甲自检」回执口令。
 "@
 }
@@ -373,8 +498,15 @@ function Write-Atomic {
     $tmp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($Path) + '.tmp' + (Get-Random))
     $enc = New-Object System.Text.UTF8Encoding($false)   # 无 BOM
     [System.IO.File]::WriteAllText($tmp, $Content, $enc)
-    if (Test-Path $Path) { Remove-Item $Path -Force }
-    Move-Item $tmp $Path -Force
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($tmp, $Path, [System.Management.Automation.Language.NullString]::Value)
+        } else {
+            [System.IO.File]::Move($tmp, $Path)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+    }
 }
 
 # ── 动作 ──────────────────────────────────────────────────────────────────────
@@ -389,12 +521,21 @@ function Invoke-Install {
     $compo = Build-Composition
     $meta  = Build-Meta -Name $PresetName
 
+    # 先生成并验证全部注册修改，再开始写盘。
+    $registrations = @()
+    foreach ($p in $Script:PresetProfiles) {
+        $before = Get-ProfilePatchText -Path $p.PatchPath
+        $after = Update-RegistrationText -Text $before -Block (Build-Registration -Composition $compo)
+        $registrations += [pscustomobject]@{ Path = $p.PatchPath; Before = $before; After = $after }
+    }
+
     if ($DryRun) {
         Write-Step 'DRY-RUN：以下内容【不会】真正写入'
         Write-Host ''
         Write-Host "  目标目录 : $targetDir"
         Write-Host "  $Script:CompoFile : $($compo.Length) 字符"
         Write-Host "  $Script:MetaFile  : $($meta.Length) 字符"
+        foreach ($r in $registrations) { Write-Host "  profile 注册 : $($r.Path)" }
         Write-Host ''
         Write-Host '  ---- preset.yml 全文 ----' -ForegroundColor DarkGray
         $meta.TrimEnd() -split "`r?`n" | ForEach-Object { Write-Host "  | $_" -ForegroundColor DarkGray }
@@ -414,6 +555,9 @@ function Invoke-Install {
 
     Write-Atomic -Path $compoPath -Content $compo
     Write-Atomic -Path $metaPath  -Content $meta
+    foreach ($r in $registrations) {
+        Save-ProfilePatch -Path $r.Path -Before $r.Before -After $r.After
+    }
 
     Write-Ok "已写入：$compoPath  ($($compo.Length) 字符)"
     Write-Ok "已写入：$metaPath  ($($meta.Length) 字符)"
@@ -423,7 +567,16 @@ function Invoke-Uninstall {
     param([string]$PresetRoot)
     $targetDir = Join-Path $PresetRoot $PresetId
 
+    # 先检查全部注册块，再移除；备份保留用户的其他配置。
+    $removals = @()
+    foreach ($p in $Script:PresetProfiles) {
+        $before = Get-ProfilePatchText -Path $p.PatchPath
+        $after = Update-RegistrationText -Text $before -Remove
+        $removals += [pscustomobject]@{ Path = $p.PatchPath; Before = $before; After = $after }
+    }
+
     if (-not (Test-Path $targetDir)) {
+        foreach ($r in $removals) { Save-ProfilePatch -Path $r.Path -Before $r.Before -After $r.After }
         Write-Warn2 "未找到 $targetDir ，无需卸载。"
         return $true
     }
@@ -439,6 +592,7 @@ function Invoke-Uninstall {
     }
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    foreach ($r in $removals) { Save-ProfilePatch -Path $r.Path -Before $r.Before -After $r.After }
     $trash = Join-Path $PresetRoot ("_uninstalled-$PresetId-$stamp")
     Move-Item $targetDir $trash -Force
     Write-Ok "已卸载，原目录移动到：$trash"
@@ -510,6 +664,23 @@ function Invoke-Check {
     Write-Host ''
     Write-Host ("  composition 顶层 row 数 : $toolRows")
 
+    foreach ($p in $Script:PresetProfiles) {
+        $patchText = Get-ProfilePatchText -Path $p.PatchPath
+        $blocks = [regex]::Matches($patchText, (Get-RegistrationPattern))
+        $expected = Build-Registration -Composition $text
+        if ($blocks.Count -eq 1 -and
+            ($blocks[0].Value -replace '\r\n', "`n") -ceq ($expected -replace '\r\n', "`n")) {
+            Write-Ok "profile $($p.Name) 的注册内容与 composition 一致"
+        } else {
+            Write-Err2 "profile $($p.Name) 未注册或注册内容不一致，请重新运行 install。"
+            $fails++
+        }
+    }
+    if ($Script:PresetProfiles.Count -gt 0 -and $text.Contains('@deepseek-ai/dsh-workflow-worker-thread')) {
+        Write-Err2 'composition 仍引用旧版 workflow-worker-thread，当前客户端不提供该插件。'
+        $fails++
+    }
+
     # 5 DSH 是否在运行
     Write-Host ''
     $procs = @(Get-DshProcesses)
@@ -522,7 +693,10 @@ function Invoke-Check {
 
     Write-Host ''
     if ($fails -eq 0) {
-        Write-Ok '自检通过：破甲模式已就位。'
+        Write-Ok '文件与注册自检通过（客户端运行时加载仍需确认）。'
+        if ($Script:PresetProfiles.Count -eq 0) {
+            Write-Warn2 '未发现现代 Web bundle profile：仅检查了旧版 preset 文件，无法确认客户端是否扫描该目录。'
+        }
         Write-Host ''
         Write-Host '  下一步：' -ForegroundColor Cyan
         Write-Host '    1) 完全退出 DSH（含托盘）'
@@ -611,6 +785,14 @@ function Show-DshDiagnose {
     Write-Host ("  " + $pj + "  →  " + $(if (Test-Path -LiteralPath $pj) { '存在' } else { '不存在' }))
 
     Write-Host ''
+    Write-Host '  ── 现代版 profile 注册 ────────────────────────────' -ForegroundColor DarkCyan
+    foreach ($p in $Script:PresetProfiles) {
+        $registered = [regex]::IsMatch((Get-ProfilePatchText -Path $p.PatchPath), (Get-RegistrationPattern))
+        Write-Host ("  $($p.Name) : $($p.PatchPath)  注册=$registered")
+    }
+    if ($Script:PresetProfiles.Count -eq 0) { Write-Host '  未发现包含 dsh-web-app bundle 的 profile，采用旧版文件布局。' }
+
+    Write-Host ''
     Write-Host '  ── 运行中的 DSH 进程 ────────────────────────────────' -ForegroundColor DarkCyan
     $procs = @(Get-DshProcesses)
     if ($procs.Count -eq 0) {
@@ -648,10 +830,14 @@ Write-Banner
 $readOnly = ($Script:ReadOnlyActions -contains $Action)
 
 try {
+    if ($PresetId -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_-]*$') {
+        throw 'PresetId 只能包含字母、数字、横线与下划线，且须以字母或数字开头。'
+    }
     $info       = Resolve-DshHome -Explicit $DshHome
     $chosen     = $info.Chosen
     $dshHome    = $chosen.Path
     $presetRoot = Join-Path $dshHome '.agent-presets'
+    $Script:PresetProfiles = @(Get-PresetProfiles -HomePath $dshHome)
 
     # 进入时的状态 —— 只读动作结束时用它自证"没建目录"
     $rootExistedBefore = Test-Path -LiteralPath $presetRoot
@@ -664,6 +850,9 @@ try {
     Write-Host "  preset 根目录 : $presetRoot"
     Write-Host "  preset id     : $PresetId"
     Write-Host "  显示名        : $PresetName"
+    if ($Script:PresetProfiles.Count -gt 0) {
+        Write-Host ("  注册 profiles : " + (($Script:PresetProfiles | ForEach-Object Name) -join ', '))
+    }
     Write-Host ''
 
     if ($Action -eq 'diagnose') {
@@ -691,12 +880,14 @@ try {
 
     switch ($Action) {
         'list'    { Invoke-List -PresetRoot $presetRoot }
-        'check'   { [void](Invoke-Check -DshHome $dshHome -PresetRoot $presetRoot) }
+        'check'   {
+            if (-not (Invoke-Check -DshHome $dshHome -PresetRoot $presetRoot)) { exit 1 }
+        }
         'dry-run' { Invoke-Install -DshHome $dshHome -PresetRoot $presetRoot -DryRun }
         'install' {
             Invoke-Install -DshHome $dshHome -PresetRoot $presetRoot
             Write-Host ''
-            [void](Invoke-Check -DshHome $dshHome -PresetRoot $presetRoot)
+            if (-not (Invoke-Check -DshHome $dshHome -PresetRoot $presetRoot)) { exit 1 }
             if ($info.Ambiguous) {
                 Write-Host ''
                 Write-Warn2 "本机检测到 $($info.ExistingCount) 个疑似 DSH 数据目录，本次自动选了 $($info.Chosen.Path)。"

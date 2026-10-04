@@ -78,7 +78,9 @@ jobs:
             $env:DSH_HOME = $target
             ./unlock-dsh.ps1 $act | Out-Host
             $code = $LASTEXITCODE
-            if ($code -ne 0)      { Write-Host "FAIL $act exit=$code"; $fail++ }
+            # check reports missing preset files with a nonzero exit code.
+            $expected = if ($act -eq "check") { 1 } else { 0 }
+            if ($code -ne $expected) { Write-Host "FAIL $act exit=$code expected=$expected"; $fail++ }
             if (Test-Path $target) { Write-Host "FAIL $act 创建了 $target"; $fail++ }
             else { Write-Host "OK   $act exit=$code 且未创建 $target" }
           }
@@ -162,3 +164,11 @@ jobs:
             Write-Host "FAIL 卸载后目录仍在"; exit 1
           }
           Write-Host "OK  卸载完成（原目录已移到 _uninstalled-*）"
+
+      - name: Modern profile registration (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tests/installer.ps1
+
+      - name: Modern profile registration (PowerShell 7)
+        shell: pwsh
+        run: ./tests/installer.ps1
