@@ -13,8 +13,7 @@ $files = @(
     'unlock-dsh.ps1',
     'README.md',
     'LICENSE',
-    'assets\agent.cordis.yml.tmpl',
-    'assets\preset.yml.tmpl'
+    'assets\pj-mode.patch.yml.tmpl'
 )
 
 Write-Host '[*] 编码门禁检查' -ForegroundColor Cyan
@@ -40,7 +39,7 @@ if ($vb[0] -eq 239 -and $vb[1] -eq 187 -and $vb[2] -eq 191) {
 Write-Host '  [OK] unlock-dsh-silent.vbs = ANSI/GBK' -ForegroundColor Green
 
 # 模板必须无 BOM（DSH 的 YAML 加载器要求）
-foreach ($t in @('assets\agent.cordis.yml.tmpl', 'assets\preset.yml.tmpl')) {
+foreach ($t in @('assets\pj-mode.patch.yml.tmpl')) {
     $tb = [System.IO.File]::ReadAllBytes((Join-Path $src $t))
     if ($tb[0] -eq 239 -and $tb[1] -eq 187 -and $tb[2] -eq 191) {
         throw "$t 带 BOM —— DSH 的 YAML 加载器会解析失败"

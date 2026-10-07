@@ -36,7 +36,7 @@ If WScript.Arguments.Count > 0 Then
   If Len(Trim(WScript.Arguments(0))) > 0 Then action = LCase(Trim(WScript.Arguments(0)))
 End If
 Select Case action
-  Case "install", "uninstall", "check", "dry-run", "list", "diagnose"
+  Case "install", "uninstall", "check", "verify", "dry-run", "list", "diagnose"
   Case Else
     action = "install"
 End Select
